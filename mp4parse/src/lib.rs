@@ -2427,12 +2427,30 @@ impl<T> Drop for BMFFBox<'_, T> {
 ///
 /// See ISOBMFF (ISO 14496-12:2020) § 4.2
 pub fn read_box_header<T: ReadBytesExt>(src: &mut T) -> Result<BoxHeader> {
+    read_box_header_impl(src, false)
+}
+
+/// Read and parse a box header at the top level of a file, where a size of
+/// 0 indicates the box extends to the end of the file. See ISOBMFF
+/// (ISO 14496-12:2020) § 4.2: "If size is 0, then this box is the last one
+/// in the file, and its contents extend to the end of the file (normally
+/// only used for a Media Data Box)". Such boxes are produced by some
+/// recorders which cannot seek back to finalize the box size, and may carry
+/// types other than the traditional `mdat` (e.g. `free` or proprietary
+/// extension boxes), so any box type is accepted here.
+fn read_top_level_box_header<T: ReadBytesExt>(src: &mut T) -> Result<BoxHeader> {
+    read_box_header_impl(src, true)
+}
+
+fn read_box_header_impl<T: ReadBytesExt>(src: &mut T, top_level: bool) -> Result<BoxHeader> {
     let size32 = be_u32(src)?;
     let name = BoxType::from(be_u32(src)?);
     let size = match size32 {
-        // valid only for top-level box and indicates it's the last box in the file.  usually mdat.
+        // Valid only for a top-level box and indicates it's the last box in
+        // the file. Usually mdat, which we also accept nested for
+        // compatibility with existing content.
         0 => {
-            if name == BoxType::MediaDataBox {
+            if top_level || name == BoxType::MediaDataBox {
                 0
             } else {
                 return Err(Error::Unsupported("unknown sized box"));
@@ -2524,6 +2542,18 @@ pub fn skip_box_remain<T: Read>(src: &mut BMFFBox<T>) -> Result<()> {
         len
     };
     skip(src, remain)
+}
+
+/// Skip over the contents of a box with an unknown size (a size field of 0),
+/// which extends to the end of the stream. Only valid for top-level boxes.
+/// See ISOBMFF (ISO 14496-12:2020) § 4.2.
+fn skip_unknown_sized_box_content<T: Read>(src: &mut BMFFBox<T>) -> Result<()> {
+    debug!("{:?} (skipped to end of stream)", src.get_header());
+    std::io::copy(&mut src.content, &mut std::io::sink())?;
+    // Mark the content as consumed; the underlying reader is at EOF but the
+    // `Take` limit (u64::MAX for an unknown-sized box) is not.
+    src.content.set_limit(0);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4489,10 +4519,28 @@ fn read_iloc<T: Read>(src: &mut BMFFBox<T>) -> Result<TryHashMap<ItemId, ItemLoc
 pub fn read_mp4<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<MediaContext> {
     let mut context = None;
     let mut found_ftyp = false;
-    // TODO(kinetik): Top-level parsing should handle zero-sized boxes
-    // rather than throwing an error.
-    let mut iter = BoxIter::new(f);
-    while let Some(mut b) = iter.next_box()? {
+    loop {
+        // Top-level boxes with a size of 0 extend to the end of the file;
+        // read the header with read_top_level_box_header so such files are
+        // handled rather than throwing an error.
+        let mut b = match read_top_level_box_header(f) {
+            Ok(head) => {
+                let content_size = if head.size == 0 {
+                    // Unknown-sized box: content extends to the end of the
+                    // stream, so don't limit the content.
+                    u64::MAX
+                } else {
+                    head.size.saturating_sub(head.offset)
+                };
+                BMFFBox {
+                    head,
+                    content: f.take(content_size),
+                }
+            }
+            Err(Error::UnexpectedEOF) => break,
+            Err(e) => return Err(e),
+        };
+        let unknown_sized = b.head.size == 0;
         // box ordering: ftyp before any variable length box (inc. moov),
         // but may not be first box in file if file signatures etc. present
         // fragmented mp4 order: ftyp, moov, pairs of moof/mdat (1-multiple), mfra
@@ -4523,8 +4571,20 @@ pub fn read_mp4<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Media
                     ctx.metadata = Some(read_meta(&mut b));
                 }
             }
-            _ => skip_box_content(&mut b)?,
+            _ => {
+                if unknown_sized {
+                    skip_unknown_sized_box_content(&mut b)?;
+                } else {
+                    skip_box_content(&mut b)?;
+                }
+            }
         };
+        if unknown_sized {
+            // A zero-sized box extends to the end of the file, so it must be
+            // the last box; nothing can follow it.
+            b.content.set_limit(0);
+            break;
+        }
         check_parser_state!(b.content);
         if context.is_some() {
             debug!(
